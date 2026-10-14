@@ -2,222 +2,578 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Mano invisible</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Kiko Salta</title>
 <style>
-  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#fff}
-  #lienzo{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#fff;
+    -webkit-user-select:none;user-select:none;touch-action:none}
+  #pantalla{position:fixed;inset:0;width:100%;height:100%;display:block}
   video{display:none}
-  #estado{position:fixed;top:calc(12px + env(safe-area-inset-top));left:16px;right:16px;text-align:center;
-    font-size:15px;background:rgba(0,0,0,.5);padding:8px 12px;border-radius:12px;transition:opacity .4s}
-  #inicio{position:fixed;inset:0;display:none;flex-direction:column;gap:16px;align-items:center;justify-content:center;
-    background:#0b0b0f;text-align:center;padding:24px}
-  #inicio button{font:inherit;font-size:16px;border:0;border-radius:999px;padding:14px 22px;background:#fff;color:#111;font-weight:600}
+  .capa{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;
+    background:rgba(10,14,30,.88);text-align:center;padding:20px}
+  .capa h1{margin:0;font-size:30px;letter-spacing:1px}
+  .capa p{margin:0;opacity:.85;max-width:420px;line-height:1.4}
+  .reglas{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;text-align:left;font-size:15px;
+    background:rgba(255,255,255,.08);padding:12px 16px;border-radius:14px}
+  .reglas b{font-size:20px;text-align:center}
+  button{font:inherit;font-size:17px;border:0;border-radius:999px;padding:13px 26px;background:#ffcf3d;color:#2a1a00;font-weight:700}
+  .oculto{display:none}
 </style>
 </head>
 <body>
 <video id="video" playsinline muted autoplay></video>
-<canvas id="lienzo"></canvas>
-<div id="estado">Cargando…</div>
-<div id="inicio">
-  <p>Toca para activar la cámara</p>
-  <button id="btnIniciar">Iniciar</button>
+<canvas id="pantalla"></canvas>
+
+<div id="inicio" class="capa">
+  <h1>🦊 Kiko Salta</h1>
+  <div class="reglas">
+    <b>👉</b><span>Señala con el índice → avanza (hacia donde apuntes)</span>
+    <b>☝️</b><span>Levanta el dedo → salta</span>
+    <b>☝️☝️</b><span>Levántalo otra vez en el aire → doble salto</span>
+    <b>✊</b><span>Encoge el dedo → agacharse / deslizarse</span>
+  </div>
+  <p>Pon el celular en horizontal, apóyalo y deja tu mano visible frente a la cámara frontal.</p>
+  <button id="btnJugar">Jugar</button>
+  <p id="error" style="color:#ff8a80"></p>
+</div>
+
+<div id="fin" class="capa oculto">
+  <h1 id="finTitulo"></h1>
+  <p id="finTexto"></p>
+  <button id="btnOtra">Jugar otra vez</button>
 </div>
 
 <script type="module">
 import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
-// ---------- Ajustes ----------
-// MediaPipe etiqueta las manos como si la imagen estuviera en espejo.
-// Con la cámara frontal sin voltear, tu mano DERECHA sale como "Left".
-// Si en tu celular reacciona la mano equivocada, cambia esto a "Right".
-const ETIQUETA_MANO_DERECHA = "Left";
-const PINZA_CIERRA = 0.28;  // dedos juntos  (proporción del tamaño de la mano)
-const PINZA_ABRE   = 0.42;  // dedos separados (histéresis para que no parpadee)
-const PULGAR = 4, INDICE = 8;
-
+/* =========================================================
+   CÁMARA Y GESTOS
+   ========================================================= */
 const video = document.getElementById("video");
-const lienzo = document.getElementById("lienzo");
-const ctx = lienzo.getContext("2d");
-const estado = document.getElementById("estado");
-
-// fondo: se aprende solo con los píxeles donde NO hay manos
-const fondo = document.createElement("canvas"), fctx = fondo.getContext("2d");
-const temp = document.createElement("canvas"), tctx = temp.getContext("2d");
-const mascara = document.createElement("canvas"), mctx = mascara.getContext("2d");
-
-let detector, ultimoTiempoVideo = -1;
-let manos = [], derecha = null, ultimaVezDerecha = 0;
-let pinza = false, ocultaDesde = 0;
-
-const ponerEstado = (t, ocultar = false) => {
-  estado.textContent = t; estado.style.opacity = 1;
-  if (ocultar) setTimeout(() => estado.style.opacity = 0, 2500);
-};
+let detector = null, ultimoTiempoVideo = -1, ultimaVezMano = 0;
+let gestoCrudo = "nada", gestoPrevioCrudo = "nada", gesto = "nada";
+let puntosIndice = null; // para dibujar en la vista previa
 
 async function crearDetector() {
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-  const op = (delegate) => ({
+  const op = d => ({
     baseOptions: {
       modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-      delegate
+      delegate: d
     },
-    runningMode: "VIDEO", numHands: 2,
+    runningMode: "VIDEO", numHands: 1,
     minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
   });
   try { return await HandLandmarker.createFromOptions(vision, op("GPU")); }
   catch { return await HandLandmarker.createFromOptions(vision, op("CPU")); }
 }
 
-async function iniciar() {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 540 } }, audio: false
+async function abrirCamara() {
+  const s = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false
   });
-  video.srcObject = stream;
-  await video.play();
+  video.srcObject = s; await video.play();
 }
 
-// Arranca solo; si el navegador exige un toque, muestra el botón
-(async () => {
-  try {
-    ponerEstado("Cargando…");
-    const det = crearDetector();
-    await iniciar();
-    detector = await det;
-    listo();
-  } catch {
-    document.getElementById("inicio").style.display = "flex";
-  }
-})();
-document.getElementById("btnIniciar").onclick = async () => {
-  document.getElementById("inicio").style.display = "none";
-  try {
-    ponerEstado("Cargando…");
-    const det = detector ? Promise.resolve(detector) : crearDetector();
-    await iniciar();
-    detector = await det;
-    listo();
-  } catch (e) {
-    ponerEstado("No se pudo abrir la cámara: " + e.message + " (la página debe estar en HTTPS)");
-  }
-};
-function listo() {
-  ponerEstado("Mueve tu mano un poco por la pantalla y luego junta pulgar e índice", true);
-  requestAnimationFrame(bucle);
-}
-
-// ---------- Utilidades ----------
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-const tamano = m => dist(m[0], m[9]);
 
-function aPixeles(mano) {
-  const w = lienzo.width, h = lienzo.height;
-  return mano.map(p => ({ x: (1 - p.x) * w, y: p.y * h })); // espejo
+function clasificar(lm) {
+  const asp = video.videoWidth / video.videoHeight || 1.33;
+  const P = i => ({ x: (1 - lm[i].x) * asp, y: lm[i].y }); // espejo + corrección de aspecto
+  const mun = P(0), mcp = P(5), tip = P(8);
+  const r = dist(mun, tip) / dist(mun, mcp);
+  if (r < 1.3) return "agachar";        // dedo encogido
+  if (r < 1.55) return null;            // zona dudosa: mantener lo anterior
+  const ang = Math.atan2(-(tip.y - mcp.y), tip.x - mcp.x) * 180 / Math.PI;
+  if (ang > 50 && ang < 130) return "arriba";
+  if (ang >= -50 && ang <= 50) return "derecha";
+  if (ang >= 130 || ang <= -130) return "izquierda";
+  return "nada";                        // apuntando hacia abajo
 }
 
-function envolvente(puntos) {
-  const p = [...puntos].sort((a, b) => a.x - b.x || a.y - b.y);
-  const cruz = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-  const inf = [], sup = [];
-  for (const q of p) { while (inf.length >= 2 && cruz(inf.at(-2), inf.at(-1), q) <= 0) inf.pop(); inf.push(q); }
-  for (const q of p.reverse()) { while (sup.length >= 2 && cruz(sup.at(-2), sup.at(-1), q) <= 0) sup.pop(); sup.push(q); }
-  return inf.slice(0, -1).concat(sup.slice(0, -1));
-}
-
-// Contorno de la mano + un tramo de muñeca/antebrazo
-function contorno(m) {
-  const s = tamano(m);
-  const dx = (m[0].x - m[9].x) / s, dy = (m[0].y - m[9].y) / s;
-  const brazo = { x: m[0].x + dx * s * 0.9, y: m[0].y + dy * s * 0.9 };
-  return envolvente([...m, brazo]);
-}
-
-function trazarManos(c, lista, margen) {
-  c.fillStyle = c.strokeStyle = "#fff";
-  c.lineJoin = c.lineCap = "round";
-  for (const m of lista) {
-    const pts = contorno(m);
-    c.lineWidth = tamano(m) * margen;
-    c.beginPath();
-    pts.forEach((p, i) => i ? c.lineTo(p.x, p.y) : c.moveTo(p.x, p.y));
-    c.closePath(); c.fill(); c.stroke();
-  }
-}
-
-// ---------- Bucle ----------
-function bucle() {
-  requestAnimationFrame(bucle);
-  if (video.readyState < 2) return;
-
-  const w = video.videoWidth, h = video.videoHeight;
-  if (lienzo.width !== w || lienzo.height !== h) {
-    for (const c of [lienzo, fondo, temp, mascara]) { c.width = w; c.height = h; }
-  }
-
-  // 1) Cuadro actual en espejo
-  ctx.save(); ctx.translate(w, 0); ctx.scale(-1, 1);
-  ctx.drawImage(video, 0, 0, w, h);
-  ctx.restore();
-
-  // 2) Detectar manos y quedarse con la derecha
+let saltoPendiente = 0;
+function leerGestos() {
+  if (!detector || video.readyState < 2) return;
   const ahora = performance.now();
   if (video.currentTime !== ultimoTiempoVideo) {
     ultimoTiempoVideo = video.currentTime;
     const r = detector.detectForVideo(video, ahora);
-    manos = []; let d = null;
-    (r.landmarks || []).forEach((lm, i) => {
-      const px = aPixeles(lm);
-      manos.push(px);
-      const lado = r.handedness?.[i]?.[0]?.categoryName;
-      if (lado === ETIQUETA_MANO_DERECHA) d = px;
-    });
-    if (d) { derecha = d; ultimaVezDerecha = ahora; }
+    if (r.landmarks && r.landmarks.length) {
+      const lm = r.landmarks[0];
+      ultimaVezMano = ahora;
+      puntosIndice = [0, 5, 6, 7, 8].map(i => ({ x: 1 - lm[i].x, y: lm[i].y }));
+      const c = clasificar(lm);
+      if (c !== null) {
+        // estabilizar: el gesto debe repetirse 2 lecturas seguidas
+        if (c === gestoPrevioCrudo) gestoCrudo = c;
+        gestoPrevioCrudo = c;
+      }
+    }
   }
-  const hayDerecha = ahora - ultimaVezDerecha < 300;
+  if (ahora - ultimaVezMano > 350) { gestoCrudo = "nada"; puntosIndice = null; }
+  if (gestoCrudo === "arriba" && gesto !== "arriba") saltoPendiente = 8; // flanco de subida
+  gesto = gestoCrudo;
+}
 
-  // 3) Aprender el fondo: copiar el cuadro excepto donde hay manos
-  tctx.globalCompositeOperation = "source-over";
-  tctx.clearRect(0, 0, w, h);
-  tctx.drawImage(lienzo, 0, 0);
-  const excluir = hayDerecha ? [...manos, derecha] : manos;
-  if (excluir.length) {
-    tctx.globalCompositeOperation = "destination-out";
-    trazarManos(tctx, excluir, 1.0);   // margen amplio para no "ensuciar" el fondo
-    tctx.globalCompositeOperation = "source-over";
+// Teclado (para probar en computadora)
+const teclas = new Set();
+addEventListener("keydown", e => {
+  if ((e.key === "ArrowUp" || e.key === " ") && !teclas.has(e.key)) saltoPendiente = 8;
+  teclas.add(e.key);
+});
+addEventListener("keyup", e => teclas.delete(e.key));
+function gestoTeclado() {
+  if (teclas.has("ArrowDown")) return "agachar";
+  if (teclas.has("ArrowRight")) return "derecha";
+  if (teclas.has("ArrowLeft")) return "izquierda";
+  return null;
+}
+
+/* =========================================================
+   NIVEL
+   ========================================================= */
+const T = 16, FILAS = 15, COLS = 210, SUELO_Y = 13 * T, META_COL = 200;
+let mapa, monedas, enemigos, particulas;
+
+function construirNivel() {
+  mapa = Array.from({ length: FILAS }, () => Array(COLS).fill("."));
+  const set = (c, r, ch) => { if (c >= 0 && c < COLS && r >= 0 && r < FILAS) mapa[r][c] = ch; };
+  const suelo = (a, b) => { for (let c = a; c <= b; c++) { set(c, 13, "G"); set(c, 14, "G"); } };
+  const fila = (a, b, r, ch = "B") => { for (let c = a; c <= b; c++) set(c, r, ch); };
+  const col = (c, r1, r2, ch = "B") => { for (let r = r1; r <= r2; r++) set(c, r, ch); };
+
+  suelo(0, 28); suelo(32, 60); suelo(64, 95); suelo(100, 130); suelo(138, 170); suelo(174, 209);
+  fila(15, 20, 9); set(17, 9, "?"); set(19, 9, "?");
+  col(38, 11, 12);
+  fila(44, 48, 9); set(46, 9, "?");
+  fila(50, 53, 6); set(51, 6, "?");
+  col(68, 10, 12);
+  col(80, 10, 12); col(81, 10, 12);
+  fila(86, 90, 9); set(88, 9, "?");
+  fila(108, 116, 10); fila(108, 116, 11);          // túnel: hay que agacharse
+  fila(122, 125, 9); set(123, 9, "?");
+  fila(144, 148, 9); set(146, 9, "?");
+  fila(152, 155, 6);
+  col(160, 11, 12);
+  for (let i = 0; i < 6; i++) col(180 + i, 12 - i, 12); // escalera
+  col(META_COL, 2, 11, "|"); set(META_COL, 12, "B");     // bandera
+
+  monedas = [];
+  const mon = (a, b, r) => { for (let c = a; c <= b; c++) monedas.push({ x: c * T + 4, y: r * T + 3, w: 8, h: 10, ok: false }); };
+  mon(29, 31, 9); mon(44, 48, 8); mon(50, 53, 5); mon(61, 63, 9); mon(86, 90, 8); mon(96, 99, 8);
+  mon(109, 115, 12); mon(131, 137, 6); mon(152, 155, 5); mon(171, 173, 9); mon(186, 190, 10);
+
+  enemigos = [];
+  for (const c of [24, 56, 72, 90, 120, 127, 150, 164, 192])
+    enemigos.push({ tipo: "caminante", x: c * T, y: SUELO_Y - 14, w: 14, h: 14, vx: -0.6, vy: 0, vivo: true, activo: false, aplastado: 0 });
+  for (const c of [104, 142, 167])
+    enemigos.push({ tipo: "murcielago", x: c * T, y: 181, base: 181, w: 12, h: 8, vx: -0.7, t: 0, vivo: true, activo: false, aplastado: 0 });
+
+  particulas = [];
+}
+
+const solido = (c, r) => {
+  if (c < 0 || c >= COLS) return true;
+  if (r < 0 || r >= FILAS) return false;
+  return "GB?U".includes(mapa[r][c]);
+};
+function hayTecho(x, y, w, h) {
+  for (let r = Math.floor(y / T); r <= Math.floor((y + h - 1) / T); r++)
+    for (let c = Math.floor(x / T); c <= Math.floor((x + w - 1) / T); c++)
+      if (solido(c, r)) return true;
+  return false;
+}
+
+function moverX(e) {
+  e.x += e.vx;
+  const r1 = Math.floor(e.y / T), r2 = Math.floor((e.y + e.h - 1) / T);
+  if (e.vx > 0) {
+    const c = Math.floor((e.x + e.w - 1) / T);
+    for (let r = r1; r <= r2; r++) if (solido(c, r)) { e.x = c * T - e.w; e.vx = 0; return true; }
+  } else if (e.vx < 0) {
+    const c = Math.floor(e.x / T);
+    for (let r = r1; r <= r2; r++) if (solido(c, r)) { e.x = (c + 1) * T; e.vx = 0; return true; }
   }
-  fctx.drawImage(temp, 0, 0);
-
-  // 4) ¿Pulgar e índice juntos?
-  if (hayDerecha) {
-    const s = tamano(derecha), d = dist(derecha[PULGAR], derecha[INDICE]) / s;
-    if (!pinza && d < PINZA_CIERRA) pinza = true;
-    else if (pinza && d > PINZA_ABRE) pinza = false;
-  } else if (ahora - ultimaVezDerecha > 600) {
-    pinza = false;
-  }
-
-  // 5) Efecto
-  if (pinza && hayDerecha) {
-    mctx.globalCompositeOperation = "source-over";
-    mctx.clearRect(0, 0, w, h);
-    mctx.filter = "blur(10px)";
-    trazarManos(mctx, [derecha], 0.75);
-    mctx.filter = "none";
-    mctx.globalCompositeOperation = "source-in";
-    mctx.drawImage(fondo, 0, 0);
-    ctx.drawImage(mascara, 0, 0);
-  } else if (hayDerecha) {
-    const s = tamano(derecha), p = derecha[PULGAR], i = derecha[INDICE];
-    ctx.strokeStyle = "#00e5ff"; ctx.lineWidth = Math.max(3, s * 0.06);
-    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(i.x, i.y); ctx.stroke();
-    for (const q of [p, i]) {
-      ctx.beginPath(); ctx.arc(q.x, q.y, Math.max(8, s * 0.12), 0, Math.PI * 2);
-      ctx.fillStyle = "#00e5ff"; ctx.fill();
-      ctx.lineWidth = 3; ctx.strokeStyle = "#fff"; ctx.stroke();
+  return false;
+}
+function moverY(e, alGolpear) {
+  e.y += e.vy; e.suelo = false;
+  const c1 = Math.floor(e.x / T), c2 = Math.floor((e.x + e.w - 1) / T);
+  if (e.vy > 0) {
+    const r = Math.floor((e.y + e.h - 1) / T);
+    for (let c = c1; c <= c2; c++) if (solido(c, r)) { e.y = r * T - e.h; e.vy = 0; e.suelo = true; return; }
+  } else if (e.vy < 0) {
+    const r = Math.floor(e.y / T);
+    for (let c = c1; c <= c2; c++) if (solido(c, r)) {
+      e.y = (r + 1) * T; e.vy = 0;
+      if (alGolpear) alGolpear(Math.floor((e.x + e.w / 2) / T), r);
+      return;
     }
   }
 }
+
+/* =========================================================
+   JUGADOR Y LÓGICA
+   ========================================================= */
+const VEL = 2.2, GRAV = 0.45, SALTO = 8.6, SALTO2 = 7.6;
+let p, camX = 0, vidas, contMonedas, puntos, checkpoint, estado = "inicio", reloj = 0;
+
+function reiniciarJugador() {
+  p = { x: checkpoint, y: SUELO_Y - 22, w: 12, h: 22, vx: 0, vy: 0, suelo: false, saltos: 0,
+        agachado: false, dir: 1, coyote: 0, inv: 90, paso: 0 };
+}
+function nuevaPartida() {
+  construirNivel();
+  vidas = 3; contMonedas = 0; puntos = 0; checkpoint = 2 * T;
+  reiniciarJugador();
+  estado = "jugando";
+}
+
+function golpearBloque(c, r) {
+  if (mapa[r] && mapa[r][c] === "?") {
+    mapa[r][c] = "U"; contMonedas++; puntos += 50;
+    particulas.push({ tipo: "moneda", x: c * T + 4, y: r * T - 8, vy: -4, vida: 26 });
+  }
+}
+
+function morir() {
+  vidas--;
+  if (vidas <= 0) { terminar(false); return; }
+  reiniciarJugador();
+}
+
+const choca = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+function actualizar(vw) {
+  reloj++;
+  const g = gestoTeclado() ?? gesto;
+
+  // agacharse / levantarse
+  const quiereAgachar = g === "agachar" && p.suelo;
+  if (quiereAgachar && !p.agachado) { p.agachado = true; p.y += 10; p.h = 12; }
+  else if (!quiereAgachar && p.agachado && !hayTecho(p.x, p.y - 10, p.w, 10)) { p.agachado = false; p.y -= 10; p.h = 22; }
+
+  // horizontal
+  let objetivo = 0;
+  if (g === "derecha") { objetivo = VEL; p.dir = 1; }
+  else if (g === "izquierda") { objetivo = -VEL; p.dir = -1; }
+
+  if (p.suelo) {
+    if (p.agachado) {
+      const techoCerca = hayTecho(p.x + (p.dir > 0 ? 0 : -6), p.y - 10, p.w + 6, 10);
+      if (techoCerca) p.vx = p.dir * 1.3;      // gatear por el túnel
+      else p.vx *= 0.985;                       // deslizarse
+    } else if (objetivo) p.vx += (objetivo - p.vx) * 0.2;
+    else p.vx *= 0.75;
+  } else {
+    if (objetivo) p.vx += (objetivo - p.vx) * 0.08;
+    else p.vx *= 0.995;                         // conserva el impulso en el aire
+  }
+
+  // salto y doble salto
+  if (p.suelo) { p.coyote = 6; p.saltos = 0; } else if (p.coyote > 0) p.coyote--;
+  if (saltoPendiente > 0) {
+    saltoPendiente--;
+    if (!p.agachado) {
+      if (p.coyote > 0) { p.vy = -SALTO; p.saltos = 1; p.coyote = 0; saltoPendiente = 0; }
+      else if (p.saltos < 2) {
+        p.vy = -SALTO2; p.saltos = 2; saltoPendiente = 0;
+        for (let i = 0; i < 6; i++)
+          particulas.push({ tipo: "polvo", x: p.x + 6, y: p.y + p.h, vx: (Math.random() - .5) * 2, vy: Math.random() * 1.5, vida: 18 });
+      }
+    }
+  }
+
+  p.vy = Math.min(p.vy + GRAV, 9);
+  moverX(p);
+  moverY(p, golpearBloque);
+  if (Math.abs(p.vx) > 0.3 && p.suelo) p.paso += Math.abs(p.vx);
+  if (p.inv > 0) p.inv--;
+
+  if (p.y > FILAS * T + 40) { morir(); return; }
+  if (p.x > 101 * T) checkpoint = 101 * T;
+
+  // monedas
+  for (const m of monedas) if (!m.ok && choca(p, m)) { m.ok = true; contMonedas++; puntos += 10; }
+
+  // enemigos
+  for (const e of enemigos) {
+    if (!e.vivo) { if (e.aplastado > 0) e.aplastado--; continue; }
+    if (!e.activo && e.x - camX < vw + 24) e.activo = true;
+    if (!e.activo) continue;
+    if (e.tipo === "caminante") {
+      e.vy = Math.min(e.vy + GRAV, 8);
+      const antes = e.vx;
+      if (moverX(e)) e.vx = -antes;
+      moverY(e);
+      if (e.suelo) { // girar en los bordes
+        const frente = e.vx > 0 ? e.x + e.w + 1 : e.x - 1;
+        if (!solido(Math.floor(frente / T), Math.floor((e.y + e.h + 2) / T))) e.vx = -e.vx;
+      }
+      if (e.y > FILAS * T + 40) e.vivo = false;
+    } else {
+      e.t++; e.x += e.vx; e.y = e.base + Math.sin(e.t * 0.08) * 2;
+      if (e.x < camX - 60) e.vivo = false;
+    }
+    if (choca(p, e)) {
+      if (p.vy > 0 && p.y + p.h - e.y < 10) {
+        e.vivo = false; e.aplastado = 24; p.vy = -6; p.saltos = 1; puntos += 100;
+      } else if (p.inv === 0) { morir(); return; }
+    }
+  }
+
+  // partículas
+  for (const q of particulas) {
+    q.vida--; q.y += q.vy; q.x += q.vx || 0;
+    q.vy += q.tipo === "moneda" ? 0.3 : 0.1;
+  }
+  particulas = particulas.filter(q => q.vida > 0);
+
+  // meta
+  if (p.x + p.w >= META_COL * T) { puntos += vidas * 500; terminar(true); }
+
+  camX = Math.max(0, Math.min(p.x - vw * 0.4, COLS * T - vw));
+}
+
+/* =========================================================
+   DIBUJO
+   ========================================================= */
+const pantalla = document.getElementById("pantalla");
+const sctx = pantalla.getContext("2d");
+const virt = document.createElement("canvas");
+const ctx = virt.getContext("2d");
+let VW = 400, VH = 240, OY = 0;
+
+function ajustarTamano() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  pantalla.width = innerWidth * dpr; pantalla.height = innerHeight * dpr;
+  const asp = innerWidth / innerHeight;
+  VH = Math.max(240, Math.ceil(256 / asp));
+  VW = Math.ceil(VH * asp);
+  virt.width = VW; virt.height = VH;
+  OY = VH - FILAS * T;
+}
+addEventListener("resize", ajustarTamano);
+ajustarTamano();
+
+function rr(c, x, y, w, h, r) {
+  c.beginPath();
+  if (c.roundRect) c.roundRect(x, y, w, h, r); else c.rect(x, y, w, h);
+}
+
+function dibujarFondo() {
+  const g = ctx.createLinearGradient(0, 0, 0, VH);
+  g.addColorStop(0, "#5ab8ff"); g.addColorStop(1, "#d4f0ff");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, VW, VH);
+  // nubes
+  ctx.fillStyle = "rgba(255,255,255,.9)";
+  for (let i = 0; i < 12; i++) {
+    const x = ((i * 170 - camX * 0.25) % 2040 + 2040) % 2040 - 60;
+    const y = OY + 20 + (i * 37) % 60;
+    ctx.beginPath(); ctx.arc(x, y, 10, 0, 7); ctx.arc(x + 12, y - 5, 13, 0, 7); ctx.arc(x + 26, y, 10, 0, 7); ctx.fill();
+  }
+  // colinas
+  for (let i = 0; i < 14; i++) {
+    const x = ((i * 150 - camX * 0.5) % 2100 + 2100) % 2100 - 80;
+    ctx.fillStyle = i % 2 ? "#7cc96b" : "#66b85a";
+    ctx.beginPath(); ctx.ellipse(x, SUELO_Y + OY, 60 + (i % 3) * 20, 40 + (i % 3) * 14, 0, Math.PI, 0); ctx.fill();
+  }
+}
+
+function dibujarMapa() {
+  const c1 = Math.max(0, Math.floor(camX / T)), c2 = Math.min(COLS - 1, Math.ceil((camX + VW) / T));
+  for (let r = 0; r < FILAS; r++) for (let c = c1; c <= c2; c++) {
+    const t = mapa[r][c]; if (t === ".") continue;
+    const x = Math.round(c * T - camX), y = r * T + OY;
+    if (t === "G") {
+      ctx.fillStyle = "#8a5a2b"; ctx.fillRect(x, y, T, T);
+      ctx.fillStyle = "#74481f"; ctx.fillRect(x + 3, y + 8, 3, 3); ctx.fillRect(x + 10, y + 12, 3, 2);
+      if (r === 0 || mapa[r - 1][c] !== "G") { ctx.fillStyle = "#4fbf4a"; ctx.fillRect(x, y, T, 5); ctx.fillStyle = "#3a9e36"; ctx.fillRect(x, y + 5, T, 1); }
+    } else if (t === "B") {
+      ctx.fillStyle = "#c8693a"; ctx.fillRect(x, y, T, T);
+      ctx.fillStyle = "#8f4220";
+      ctx.fillRect(x, y + 7, T, 1); ctx.fillRect(x, y + 15, T, 1);
+      ctx.fillRect(x + 7, y, 1, 7); ctx.fillRect(x + 3, y + 8, 1, 7); ctx.fillRect(x + 12, y + 8, 1, 7);
+    } else if (t === "?") {
+      ctx.fillStyle = "#f6b92b"; ctx.fillRect(x, y, T, T);
+      ctx.strokeStyle = "#a86a00"; ctx.lineWidth = 1; ctx.strokeRect(x + .5, y + .5, T - 1, T - 1);
+      ctx.fillStyle = "#fff6d0"; ctx.font = "bold 12px monospace"; ctx.textAlign = "center";
+      ctx.fillText("?", x + 8, y + 12 + (Math.sin(reloj * 0.1 + c) > 0.9 ? -1 : 0));
+    } else if (t === "U") {
+      ctx.fillStyle = "#9c7a62"; ctx.fillRect(x, y, T, T);
+      ctx.strokeStyle = "#6d5240"; ctx.strokeRect(x + .5, y + .5, T - 1, T - 1);
+    } else if (t === "|") {
+      ctx.fillStyle = "#dfe6ea"; ctx.fillRect(x + 7, y, 2, T);
+      if (r === 2) {
+        ctx.fillStyle = "#ffcf3d"; ctx.beginPath(); ctx.arc(x + 8, y - 2, 3, 0, 7); ctx.fill();
+        const ond = Math.sin(reloj * 0.15) * 2;
+        ctx.fillStyle = "#2ecc71"; ctx.beginPath();
+        ctx.moveTo(x + 9, y + 1); ctx.lineTo(x + 24, y + 6 + ond); ctx.lineTo(x + 9, y + 12); ctx.fill();
+      }
+    }
+  }
+}
+
+function dibujarMonedas() {
+  for (const m of monedas) {
+    if (m.ok) continue;
+    const x = m.x - camX; if (x < -10 || x > VW + 10) continue;
+    const a = Math.abs(Math.sin(reloj * 0.08 + m.x)) * 4 + 1;
+    ctx.fillStyle = "#ffd23f"; ctx.beginPath(); ctx.ellipse(x + 4, m.y + 5 + OY, a, 5, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = "#fff3b0"; ctx.fillRect(x + 3, m.y + 2 + OY, 1, 4);
+  }
+}
+
+function dibujarEnemigos() {
+  for (const e of enemigos) {
+    const x = Math.round(e.x - camX), y = Math.round(e.y) + OY;
+    if (x < -20 || x > VW + 20) continue;
+    if (!e.vivo) {
+      if (e.aplastado > 0 && e.tipo === "caminante") { ctx.fillStyle = "#6a4bb0"; rr(ctx, x, y + 10, e.w, 4, 2); ctx.fill(); }
+      continue;
+    }
+    if (e.tipo === "caminante") {
+      const pata = Math.floor(reloj / 8) % 2;
+      ctx.fillStyle = "#3b2a5e"; ctx.fillRect(x + 1 + pata, y + 11, 4, 3); ctx.fillRect(x + 9 - pata, y + 11, 4, 3);
+      ctx.fillStyle = "#8b5fd1"; rr(ctx, x, y, e.w, 12, 6); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.fillRect(x + 3, y + 3, 3, 4); ctx.fillRect(x + 8, y + 3, 3, 4);
+      ctx.fillStyle = "#111"; const d = e.vx > 0 ? 1 : 0; ctx.fillRect(x + 3 + d, y + 4, 2, 3); ctx.fillRect(x + 8 + d, y + 4, 2, 3);
+      ctx.fillRect(x + 2, y + 2, 4, 1); ctx.fillRect(x + 8, y + 2, 4, 1);
+    } else {
+      const ala = Math.sin(reloj * 0.4) * 4;
+      ctx.fillStyle = "#3d3d55";
+      ctx.beginPath(); ctx.moveTo(x + 4, y + 4); ctx.lineTo(x - 5, y + 1 - ala); ctx.lineTo(x + 1, y + 7); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 8, y + 4); ctx.lineTo(x + 17, y + 1 - ala); ctx.lineTo(x + 11, y + 7); ctx.fill();
+      ctx.fillStyle = "#55557a"; rr(ctx, x + 2, y, 8, 8, 4); ctx.fill();
+      ctx.fillStyle = "#ff5252"; ctx.fillRect(x + 3, y + 3, 2, 2); ctx.fillRect(x + 7, y + 3, 2, 2);
+    }
+  }
+}
+
+function dibujarJugador() {
+  if (p.inv > 0 && Math.floor(p.inv / 4) % 2) return;
+  const x = Math.round(p.x - camX), y = Math.round(p.y) + OY, w = p.w, h = p.h, d = p.dir;
+  // bufanda
+  const ond = Math.sin(reloj * 0.3) * 2;
+  ctx.fillStyle = "#2f7dff";
+  const cx = d > 0 ? x : x + w;
+  ctx.beginPath(); ctx.moveTo(cx, y + (p.agachado ? 4 : 9)); ctx.lineTo(cx - d * 9, y + (p.agachado ? 3 : 8) + ond);
+  ctx.lineTo(cx - d * 8, y + (p.agachado ? 7 : 12) + ond); ctx.lineTo(cx, y + (p.agachado ? 7 : 12)); ctx.fill();
+  // orejas
+  if (!p.agachado) {
+    ctx.fillStyle = "#e86a1f";
+    ctx.beginPath(); ctx.moveTo(x + 1, y + 4); ctx.lineTo(x + 3, y - 2); ctx.lineTo(x + 6, y + 4); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(x + 6, y + 4); ctx.lineTo(x + 9, y - 2); ctx.lineTo(x + 11, y + 4); ctx.fill();
+  }
+  // pies
+  const fase = Math.floor(p.paso / 6) % 2, enAire = !p.suelo;
+  ctx.fillStyle = "#4a2a14";
+  ctx.fillRect(x + (fase && !enAire ? 0 : 1), y + h - 3, 5, 3);
+  ctx.fillRect(x + w - (fase && !enAire ? 4 : 6), y + h - 3, 5, 3);
+  // cuerpo
+  ctx.fillStyle = "#ff8a3d"; rr(ctx, x, y + 2, w, h - 4, 5); ctx.fill();
+  ctx.fillStyle = "#ffe0c2"; rr(ctx, x + 3, y + h * 0.5, w - 6, h * 0.35, 3); ctx.fill();
+  // bufanda (cuello)
+  ctx.fillStyle = "#2f7dff"; ctx.fillRect(x, y + (p.agachado ? 4 : 9), w, 3);
+  // ojos
+  const oy = y + (p.agachado ? 1 : 4);
+  ctx.fillStyle = "#fff"; ctx.fillRect(x + 2 + d, oy, 3, 4); ctx.fillRect(x + 7 + d, oy, 3, 4);
+  ctx.fillStyle = "#111"; ctx.fillRect(x + 3 + d, oy + 1, 2, 3); ctx.fillRect(x + 8 + d, oy + 1, 2, 3);
+}
+
+function dibujarParticulas() {
+  for (const q of particulas) {
+    const x = q.x - camX, y = q.y + OY;
+    if (q.tipo === "moneda") { ctx.fillStyle = "#ffd23f"; ctx.beginPath(); ctx.ellipse(x + 4, y + 5, 3, 5, 0, 0, 7); ctx.fill(); }
+    else { ctx.fillStyle = `rgba(255,255,255,${q.vida / 18})`; ctx.fillRect(x, y, 2, 2); }
+  }
+}
+
+const ETIQUETAS = { derecha: "👉 Avanza", izquierda: "👈 Retrocede", arriba: "☝️ Salta", agachar: "✊ Agacharse", nada: "✋ —" };
+
+function dibujarHUD() {
+  const W = pantalla.width, H = pantalla.height, u = H / 100;
+  sctx.font = `700 ${Math.round(u * 6)}px system-ui,sans-serif`;
+  sctx.textAlign = "left"; sctx.textBaseline = "top";
+  sctx.fillStyle = "rgba(0,0,0,.35)"; rr(sctx, u * 2, u * 2, u * 52, u * 9, u * 2); sctx.fill();
+  sctx.fillStyle = "#fff";
+  sctx.fillText(`${"❤️".repeat(vidas)}  🪙 ${contMonedas}  ⭐ ${puntos}`, u * 3.5, u * 3.5);
+
+  // vista previa de la cámara
+  if (video.readyState >= 2) {
+    const pw = Math.min(W * 0.24, u * 44), ph = pw * video.videoHeight / video.videoWidth;
+    const px = W - pw - u * 2, py = u * 2;
+    sctx.save();
+    rr(sctx, px, py, pw, ph, u * 2); sctx.clip();
+    sctx.translate(px + pw, py); sctx.scale(-1, 1);
+    sctx.globalAlpha = 0.85; sctx.drawImage(video, 0, 0, pw, ph);
+    sctx.restore();
+    if (puntosIndice) {
+      sctx.strokeStyle = "#00e5ff"; sctx.lineWidth = u * 0.8; sctx.lineCap = "round";
+      sctx.beginPath();
+      puntosIndice.forEach((q, i) => { const X = px + q.x * pw, Y = py + q.y * ph; i ? sctx.lineTo(X, Y) : sctx.moveTo(X, Y); });
+      sctx.stroke();
+      const t = puntosIndice[4];
+      sctx.fillStyle = "#ffcf3d"; sctx.beginPath(); sctx.arc(px + t.x * pw, py + t.y * ph, u * 1.6, 0, 7); sctx.fill();
+    }
+    sctx.fillStyle = "rgba(0,0,0,.55)"; rr(sctx, px, py + ph + u, pw, u * 8, u * 2); sctx.fill();
+    sctx.fillStyle = "#fff"; sctx.textAlign = "center"; sctx.font = `700 ${Math.round(u * 5)}px system-ui,sans-serif`;
+    sctx.fillText(ETIQUETAS[gestoTeclado() ?? gesto] || "", px + pw / 2, py + ph + u * 2.3);
+  }
+}
+
+function dibujar() {
+  dibujarFondo(); dibujarMapa(); dibujarMonedas(); dibujarEnemigos(); dibujarParticulas(); dibujarJugador();
+  sctx.imageSmoothingEnabled = false;
+  sctx.drawImage(virt, 0, 0, VW, VH, 0, 0, VW * (pantalla.height / VH), pantalla.height);
+  dibujarHUD();
+}
+
+/* =========================================================
+   BUCLE Y PANTALLAS
+   ========================================================= */
+let acumulado = 0, tAnterior = performance.now();
+function bucle(t) {
+  requestAnimationFrame(bucle);
+  leerGestos();
+  acumulado += Math.min(t - tAnterior, 100); tAnterior = t;
+  while (acumulado >= 1000 / 60) {
+    if (estado === "jugando") actualizar(VW);
+    acumulado -= 1000 / 60;
+  }
+  if (p) dibujar();
+}
+
+function terminar(gano) {
+  estado = gano ? "ganaste" : "gameover";
+  document.getElementById("finTitulo").textContent = gano ? "🏁 ¡Llegaste a la meta!" : "💥 Fin del juego";
+  document.getElementById("finTexto").textContent = `Monedas: ${contMonedas}   ·   Puntos: ${puntos}`;
+  document.getElementById("fin").classList.remove("oculto");
+}
+
+document.getElementById("btnJugar").onclick = async () => {
+  const btn = document.getElementById("btnJugar"), err = document.getElementById("error");
+  btn.disabled = true; btn.textContent = "Cargando…"; err.textContent = "";
+  try {
+    document.documentElement.requestFullscreen?.()
+      .then(() => screen.orientation?.lock?.("landscape")).catch(() => {});
+    const [d] = await Promise.all([crearDetector(), abrirCamara()]);
+    detector = d;
+  } catch (e) {
+    err.textContent = "No se pudo abrir la cámara (" + e.message + "). La página debe abrirse por HTTPS. Con teclado: flechas y espacio.";
+  }
+  document.getElementById("inicio").classList.add("oculto");
+  nuevaPartida();
+  ajustarTamano();
+};
+
+document.getElementById("btnOtra").onclick = () => {
+  document.getElementById("fin").classList.add("oculto");
+  nuevaPartida();
+};
+
+requestAnimationFrame(bucle);
 </script>
 </body>
 </html>
