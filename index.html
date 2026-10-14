@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Manos invisibles</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:system-ui,-apple-system,sans-serif;color:#fff}
+  #lienzo{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}
+  video{display:none}
+  #estado{position:fixed;top:calc(12px + env(safe-area-inset-top));left:16px;right:16px;text-align:center;
+    font-size:15px;background:rgba(0,0,0,.55);padding:8px 12px;border-radius:12px}
+  #barra{position:fixed;left:0;right:0;bottom:0;display:flex;gap:10px;justify-content:center;
+    padding:14px 16px calc(14px + env(safe-area-inset-bottom));background:linear-gradient(transparent,rgba(0,0,0,.75))}
+  button{font:inherit;font-size:15px;border:0;border-radius:999px;padding:12px 18px;background:#fff;color:#111;font-weight:600}
+  button.sec{background:rgba(255,255,255,.18);color:#fff}
+  #inicio{position:fixed;inset:0;display:flex;flex-direction:column;gap:16px;align-items:center;justify-content:center;
+    background:#0b0b0f;text-align:center;padding:24px}
+  #inicio h1{margin:0;font-size:24px}
+  #inicio p{margin:0;opacity:.75;max-width:320px;line-height:1.4}
+  #flash{position:fixed;inset:0;background:#fff;opacity:0;pointer-events:none;transition:opacity .25s}
+</style>
+</head>
+<body>
+<video id="video" playsinline muted autoplay></video>
+<canvas id="lienzo"></canvas>
+<div id="flash"></div>
+<div id="estado">Cargando…</div>
+<div id="barra">
+  <button id="btnFondo" class="sec">Capturar fondo</button>
+  <button id="btnCam" class="sec">Cambiar cámara</button>
+</div>
+<div id="inicio">
+  <h1>✋ Manos invisibles 🤚</h1>
+  <p>Se marcan tu pulgar e índice. Junta las puntas de tus dedos índice (o las muñecas) y tus manos desaparecen. Júntalas otra vez para que vuelvan.</p>
+  <button id="btnIniciar">Iniciar cámara</button>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ---------- Ajustes ----------
+const MODO = "alternar";      // "alternar": juntar = desaparecen / juntar otra vez = vuelven
+                              // "mantener": desaparecen solo mientras estén juntas
+const TIEMPO_JUNTAS_MS = 300; // cuánto tiempo deben estar juntas para activar
+const PULGAR = 4, INDICE = 8; // índices de MediaPipe para las puntas
+
+const video = document.getElementById("video");
+const lienzo = document.getElementById("lienzo");
+const ctx = lienzo.getContext("2d");
+const estado = document.getElementById("estado");
+const flash = document.getElementById("flash");
+
+// Lienzo con el fondo limpio (sin manos) y lienzo para la máscara
+const fondo = document.createElement("canvas"), fctx = fondo.getContext("2d");
+const mascara = document.createElement("canvas"), mctx = mascara.getContext("2d");
+
+let detector, camara = "user", stream;
+let fondoListo = false, invisibles = false;
+let juntasDesde = 0, esperandoSeparar = false;
+let ultimasManos = [], ultimaVezManos = 0;
+let framesSinManos = 0, ultimoTiempoVideo = -1;
+let capturaManual = 0;
+
+const ponerEstado = t => estado.textContent = t;
+
+async function crearDetector() {
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  const opciones = (delegate) => ({
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate
+    },
+    runningMode: "VIDEO", numHands: 2,
+    minHandDetectionConfidence: 0.5, minTrackingConfidence: 0.5
+  });
+  try { return await HandLandmarker.createFromOptions(vision, opciones("GPU")); }
+  catch { return await HandLandmarker.createFromOptions(vision, opciones("CPU")); }
+}
+
+async function abrirCamara() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: camara, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+  fondoListo = false;
+}
+
+document.getElementById("btnIniciar").onclick = async () => {
+  try {
+    ponerEstado("Cargando modelo de manos…");
+    document.getElementById("inicio").style.display = "none";
+    [detector] = await Promise.all([crearDetector(), abrirCamara()]);
+    ponerEstado("Saca las manos del cuadro un momento para capturar el fondo");
+    requestAnimationFrame(bucle);
+  } catch (e) {
+    ponerEstado("Error: " + e.message + " (¿la página está en HTTPS y diste permiso a la cámara?)");
+  }
+};
+
+document.getElementById("btnCam").onclick = async () => {
+  camara = camara === "user" ? "environment" : "user";
+  await abrirCamara();
+};
+
+document.getElementById("btnFondo").onclick = () => {
+  capturaManual = performance.now() + 3000;
+};
+
+// ---------- Utilidades ----------
+function aPixeles(mano) {
+  const w = lienzo.width, h = lienzo.height, espejo = camara === "user";
+  return mano.map(p => ({ x: (espejo ? 1 - p.x : p.x) * w, y: p.y * h }));
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const tamano = m => dist(m[0], m[9]); // muñeca → nudillo medio
+
+function envolvente(puntos) { // casco convexo (monotone chain)
+  const p = [...puntos].sort((a, b) => a.x - b.x || a.y - b.y);
+  const cruz = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const inf = [], sup = [];
+  for (const q of p) { while (inf.length >= 2 && cruz(inf.at(-2), inf.at(-1), q) <= 0) inf.pop(); inf.push(q); }
+  for (const q of p.reverse()) { while (sup.length >= 2 && cruz(sup.at(-2), sup.at(-1), q) <= 0) sup.pop(); sup.push(q); }
+  return inf.slice(0, -1).concat(sup.slice(0, -1));
+}
+
+function manosJuntas(manos) {
+  if (manos.length < 2) return false;
+  const [a, b] = manos, s = (tamano(a) + tamano(b)) / 2;
+  const indices = dist(a[INDICE], b[INDICE]) < s * 0.45;
+  const munecas = dist(a[0], b[0]) < s * 0.9;
+  return indices || munecas;
+}
+
+function destello() {
+  flash.style.opacity = .5;
+  setTimeout(() => flash.style.opacity = 0, 120);
+}
+
+// ---------- Dibujo ----------
+function borrarManos(manos) {
+  mctx.setTransform(1, 0, 0, 1, 0, 0);
+  mctx.globalCompositeOperation = "source-over";
+  mctx.clearRect(0, 0, mascara.width, mascara.height);
+  mctx.filter = "blur(10px)";
+  mctx.fillStyle = mctx.strokeStyle = "#fff";
+  mctx.lineJoin = mctx.lineCap = "round";
+  for (const m of manos) {
+    const casco = envolvente(m);
+    mctx.lineWidth = tamano(m) * 0.75;   // margen extra para cubrir el grosor de los dedos
+    mctx.beginPath();
+    casco.forEach((p, i) => i ? mctx.lineTo(p.x, p.y) : mctx.moveTo(p.x, p.y));
+    mctx.closePath(); mctx.fill(); mctx.stroke();
+  }
+  mctx.filter = "none";
+  mctx.globalCompositeOperation = "source-in";
+  mctx.drawImage(fondo, 0, 0);
+  ctx.drawImage(mascara, 0, 0);
+}
+
+function dibujarDedos(manos) {
+  const colores = ["#00e5ff", "#ff4fd8"];
+  manos.forEach((m, i) => {
+    const s = tamano(m), p = m[PULGAR], d = m[INDICE];
+    ctx.strokeStyle = colores[i % 2];
+    ctx.lineWidth = Math.max(3, s * 0.06);
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(d.x, d.y); ctx.stroke();
+    for (const q of [p, d]) {
+      ctx.beginPath(); ctx.arc(q.x, q.y, Math.max(8, s * 0.12), 0, Math.PI * 2);
+      ctx.fillStyle = colores[i % 2]; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = "#fff"; ctx.stroke();
+    }
+  });
+}
+
+// ---------- Bucle principal ----------
+function bucle() {
+  requestAnimationFrame(bucle);
+  if (video.readyState < 2) return;
+
+  const w = video.videoWidth, h = video.videoHeight;
+  if (lienzo.width !== w || lienzo.height !== h) {
+    lienzo.width = fondo.width = mascara.width = w;
+    lienzo.height = fondo.height = mascara.height = h;
+    fondoListo = false;
+  }
+
+  // 1) Cuadro de video (en espejo si es la cámara frontal)
+  ctx.save();
+  if (camara === "user") { ctx.translate(w, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(video, 0, 0, w, h);
+  ctx.restore();
+
+  // 2) Detección de manos
+  const ahora = performance.now();
+  if (video.currentTime !== ultimoTiempoVideo) {
+    ultimoTiempoVideo = video.currentTime;
+    const r = detector.detectForVideo(video, ahora);
+    const manos = (r.landmarks || []).map(aPixeles);
+    if (manos.length) { ultimasManos = manos; ultimaVezManos = ahora; framesSinManos = 0; }
+    else framesSinManos++;
+  }
+  const hayManos = ahora - ultimaVezManos < 250;
+  const manos = hayManos ? ultimasManos : [];
+
+  // 3) Captura del fondo limpio
+  if (capturaManual) {
+    const faltan = Math.ceil((capturaManual - ahora) / 1000);
+    if (faltan > 0) ponerEstado(`Saca las manos… capturando en ${faltan}`);
+    else { fctx.drawImage(lienzo, 0, 0); fondoListo = true; capturaManual = 0; destello(); ponerEstado("Fondo capturado ✔"); }
+  } else if (framesSinManos > 15) {
+    fctx.drawImage(lienzo, 0, 0);   // se actualiza solo cuando no hay manos
+    if (!fondoListo) { fondoListo = true; ponerEstado("Listo. Junta tus manos para desaparecerlas"); }
+  }
+
+  // 4) Gesto de juntar manos
+  const juntas = manosJuntas(manos);
+  if (MODO === "mantener") {
+    invisibles = juntas || (invisibles && manos.length > 0 && ahora - juntasDesde < 400);
+    if (juntas) juntasDesde = ahora;
+  } else {
+    if (juntas && !esperandoSeparar) {
+      if (!juntasDesde) juntasDesde = ahora;
+      if (ahora - juntasDesde > TIEMPO_JUNTAS_MS) {
+        invisibles = !invisibles; esperandoSeparar = true; destello();
+        ponerEstado(invisibles ? "🫥 Manos invisibles — júntalas otra vez para volver" : "Manos visibles");
+      }
+    } else if (!juntas) {
+      juntasDesde = 0;
+      if (manos.length < 2 || !manosJuntas(manos)) esperandoSeparar = false;
+    }
+  }
+
+  // 5) Efecto
+  if (invisibles && manos.length) {
+    if (fondoListo) borrarManos(manos);
+    else ponerEstado("Necesito el fondo: toca «Capturar fondo» y saca las manos");
+  } else {
+    dibujarDedos(manos);
+  }
+}
+</script>
+</body>
+</html>
